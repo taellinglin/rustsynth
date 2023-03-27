@@ -1,84 +1,25 @@
 #[macro_use]
 extern crate vst;
-extern crate lazy_static;
-extern crate hound;
-extern crate walkdir;
-extern crate log;
-extern crate simple_logger;
-use log::info;
-use simple_logger::SimpleLogger;
-use lazy_static::lazy_static;
-use std::sync::Mutex;
-use std::path::Path;
-use walkdir::WalkDir;
+
+use std::f32::consts::PI;
+use std::sync::Arc;
 use vst::buffer::AudioBuffer;
 use vst::event::Event;
-use vst::plugin::{Category, HostCallback, Info, Plugin};
+use vst::plugin::{Category, Info, Plugin};
 
-const SAMPLES_FOLDER: &str = "/samples/";
+const MAX_VOICES: usize = 128;
 
-lazy_static! {
-    static ref SAMPLES_DATA: Mutex<Vec<Vec<f32>>> = Mutex::new(load_samples(SAMPLES_FOLDER));
+struct TriangleSynth {
+    voices: Vec<Voice>,
+    sample_rate: f32,
 }
 
-fn load_samples<P: AsRef<Path>>(folder_path: P) -> Vec<Vec<f32>> {
-    let mut samples = Vec::new();
-    for entry in WalkDir::new(folder_path) {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => continue,
-        };
 
-        if entry.file_type().is_file() {
-            let path = entry.path();
-            if let Some(ext) = path.extension() {
-                if ext == "wav" {
-                    let mut reader = match hound::WavReader::open(path) {
-                        Ok(reader) => reader,
-                        Err(_) => continue,
-                    };
-
-                    let sample_data: Vec<f32> = reader
-                        .samples::<i16>()
-                        .filter_map(Result::ok)
-                        .map(|s| s as f32 / i16::MAX as f32)
-                        .collect();
-
-                    samples.push(sample_data);
-                }
-            }
-        }
-    }
-
-    samples
-}
-
-struct PlayingSample {
-    sample_data: Vec<f32>,
-    position: usize,
-}
-
-struct SampleVst {
-    host: HostCallback,
-    playing_samples: Vec<PlayingSample>,
-}
-
-impl Default for SampleVst {
-    fn default() -> Self {
-        SimpleLogger::new().init().unwrap();
-        Self {
-            host: HostCallback::default(),
-            playing_samples: Vec::new(),
-        }
-    }
-}
-
-impl Plugin for SampleVst {
+impl Plugin for TriangleSynth {
     fn get_info(&self) -> Info {
         Info {
-            name: "SampleVst".to_string(),
-            vendor: "MyVendor".to_string(),
-            unique_id: 1357,
+            name: "TriangleSynth".to_string(),
+            unique_id: 135798642,
             inputs: 0,
             outputs: 2,
             category: Category::Synth,
@@ -86,53 +27,131 @@ impl Plugin for SampleVst {
         }
     }
 
-    fn set_sample_rate(&mut self, _rate: f32) {
-        // Update the sample rate if needed
+    fn set_sample_rate(&mut self, rate: f32) {
+        self.sample_rate = rate;
+        for voice in self.voices.iter_mut() {
+            voice.sample_rate = rate;
+        }
     }
 
     fn process_events(&mut self, events: &vst::api::Events) {
         for event in events.events() {
             match event {
                 Event::Midi(ev) => {
-                    if ev.data[0] == 144 {
-                        let note = ev.data[1] as usize % 128;
-                        info!("MIDI Note On: {}", note);
-                        let samples = SAMPLES_DATA.lock().unwrap();
-                        if note < samples.len() {
-                            self.playing_samples.push(PlayingSample {
-                                sample_data: samples[note].clone(),
-                                position: 0,
-                            });
+                    let status = ev.data[0] & 0xF0;
+                    let note = ev.data[1] as f32;
+                    let velocity = ev.data[2] as f32 / 127.0;
+                    match status {
+                        0x90 => {
+                            if velocity > 0.0 {
+                                if let Some(voice) = self.voices.iter_mut().find(|v| !v.active) {
+                                    voice.note_on(note, velocity);
+                                }
+                            } else {
+                                for voice in self.voices.iter_mut().filter(|v| v.active && v.note == note) {
+                                    voice.note_off();
+                                }
+                            }
                         }
+                        0x80 => {
+                            for voice in self.voices.iter_mut().filter(|v| v.active && v.note == note) {
+                                voice.note_off();
+                            }
+                        }
+                        _ => (),
                     }
                 }
                 _ => (),
             }
         }
     }
-    
 
     fn process(&mut self, buffer: &mut AudioBuffer<f32>) {
         let (_, mut output_buffer) = buffer.split();
+        let num_samples = output_buffer.len();
 
-        for (output_channel, data) in output_buffer.into_iter().enumerate() {
-            for output_sample in data.iter_mut() {
+        // Clear the output buffer
+        for output_channel in output_buffer.into_iter() {
+            for output_sample in output_channel {
                 *output_sample = 0.0;
-                let mut i = 0;
-                while i < self.playing_samples.len() {
-                    let playing_sample = &mut self.playing_samples[i];
-                    if playing_sample.position < playing_sample.sample_data.len() {
-                        let sample = playing_sample.sample_data[playing_sample.position];
-                        *output_sample += sample;
-                        playing_sample.position += 1;
-                        i += 1;
-                    } else {
-                        self.playing_samples.swap_remove(i);
-                    }
+            }
+        }
+
+        for voice in &mut self.voices {
+            // Skip processing if the voice is not active
+            if !voice.active {
+                continue;
+            }
+
+            let mut voice_output = vec![0.0; num_samples];
+            for (i, output) in voice_output.iter_mut().enumerate() {
+                *output = voice.next_sample();
+            }
+
+            for (output_channel, output) in output_buffer.into_iter().enumerate() {
+                for (output_sample, voice_sample) in output.iter_mut().zip(voice_output.iter()) {
+                    *output_sample += *voice_sample / MAX_VOICES as f32;
                 }
-                
             }
         }
     }
 }
-plugin_main!(SampleVst);
+
+plugin_main!(TriangleSynth);
+
+struct Voice {
+    active: bool,
+    note: f32,
+    phase: f32,
+    velocity: f32,
+    sample_rate: f32,
+}
+
+impl Voice {
+    fn new(sample_rate: f32) -> Self {
+        Voice {
+            active: false,
+            note: 0.0,
+            phase: 0.0,
+            velocity: 0.0,
+            sample_rate,
+        }
+    }
+
+    fn note_on(&mut self, note: f32, velocity: f32) {
+        self.active = true;
+        self.note = note;
+        self.velocity = velocity;
+        self.phase = 0.0;
+    }
+
+    fn note_off(&mut self) {
+        self.active = false;
+    }
+
+    fn next_sample(&mut self) -> f32 {
+        if !self.active {
+            return 0.0;
+        }
+
+        let freq = 440.0 * (2.0f32).powf((self.note - 69.0) / 12.0);
+        let value = 2.0 * self.phase - 1.0;
+
+        self.phase += freq / self.sample_rate;
+        if self.phase >= 1.0 {
+            self.phase -= 1.0;
+        }
+
+        value * self.velocity
+    }
+}
+
+impl Default for TriangleSynth {
+    fn default() -> Self {
+        let sample_rate = 44100.0;
+        TriangleSynth {
+            voices: (0..MAX_VOICES).map(|_| Voice::new(sample_rate)).collect(),
+            sample_rate,
+        }
+    }
+}
